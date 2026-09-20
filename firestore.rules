@@ -1,0 +1,348 @@
+rules_version = '2';
+
+// =============================================================================
+// LocalFind - Firestore security rules
+//
+// There is no backend server in the core app (Cloud Functions need the paid
+// Blaze plan), so THESE RULES are the server-side enforcement layer. They make
+// sure that, even if someone edits the JavaScript in their browser:
+//
+//   * only the signed-in owner can change their own shop
+//   * a shopper can only create a code that copies the shop's CURRENT offer
+//     terms (terms are locked at generation time)
+//   * a shop's daily code cap cannot be exceeded (atomic counter, see /daily)
+//   * a code can only be confirmed by the shop's owner, only once, and only
+//     within 20 minutes of generation (server clock, not the phone's clock)
+//   * reviews can only be written by the shopper of a CONFIRMED code
+//   * nobody can read another person's codes, profile or saved shops
+//
+// KEEP IN SYNC with src/lib/constants.ts: CODE_EXPIRY_MINUTES (20) and the
+// category list below.
+//
+// Optional hardening: to require a verified email before shopkeepers register
+// shops or shoppers generate codes, add `&& request.auth.token.email_verified`
+// to the `create` rules of /shops and /codes.
+// =============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    function shopPath(shopId) {
+      return /databases/$(database)/documents/shops/$(shopId);
+    }
+
+    function codePath(codeId) {
+      return /databases/$(database)/documents/codes/$(codeId);
+    }
+
+    function pad(n) {
+      return n < 10 ? '0' + string(n) : string(n);
+    }
+
+    // UTC calendar day of the server clock, e.g. "20260920".
+    function dayKey() {
+      return string(request.time.year()) + pad(request.time.month()) + pad(request.time.day());
+    }
+
+    function dayPath(shopId) {
+      return /databases/$(database)/documents/shops/$(shopId)/daily/$(dayKey());
+    }
+
+    function numOrNull(v) {
+      return v == null || (v is number && v >= 0 && v <= 10000000);
+    }
+
+    // ---------- users (private) ----------
+
+    match /users/{uid} {
+      allow get: if isSelf(uid);
+
+      allow create: if isSelf(uid)
+        && request.resource.data.keys().hasOnly(['role', 'email', 'display_name', 'created_at'])
+        && request.resource.data.role in ['shopper', 'shopkeeper']
+        && request.resource.data.display_name is string
+        && request.resource.data.display_name.size() <= 60
+        && request.resource.data.created_at == request.time;
+
+      allow update: if isSelf(uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role', 'display_name'])
+        && request.resource.data.role in ['shopper', 'shopkeeper']
+        && request.resource.data.display_name is string
+        && request.resource.data.display_name.size() <= 60;
+
+      // Bookmarks: users/{uid}/saved/{shopId}
+      match /saved/{shopId} {
+        allow read, delete: if isSelf(uid);
+        allow create: if isSelf(uid)
+          && request.resource.data.keys().hasOnly(['shop_id', 'created_at'])
+          && request.resource.data.shop_id == shopId
+          && request.resource.data.created_at == request.time;
+      }
+    }
+
+    // ---------- public profile (leaderboard) ----------
+    // Only display name + redemption count are public.
+
+    match /public_profiles/{uid} {
+      allow read: if true;
+
+      allow create: if isSelf(uid)
+        && request.resource.data.keys().hasOnly(['display_name', 'redeemed_count', 'created_at'])
+        && request.resource.data.display_name is string
+        && request.resource.data.display_name.size() <= 40
+        && request.resource.data.redeemed_count == 0
+        && request.resource.data.created_at == request.time;
+
+      // 1) owner edits their own display name
+      // 2) a shop owner bumps the count by exactly 1 IN THE SAME BATCH as
+      //    confirming a real code that belongs to this shopper and this owner.
+      allow update: if
+        (
+          isSelf(uid)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['display_name'])
+          && request.resource.data.display_name is string
+          && request.resource.data.display_name.size() <= 40
+        )
+        ||
+        (
+          signedIn() && request.auth.uid != uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['redeemed_count', 'last_code_id'])
+          && request.resource.data.redeemed_count == resource.data.redeemed_count + 1
+          && get(codePath(request.resource.data.last_code_id)).data.status == 'active'
+          && get(codePath(request.resource.data.last_code_id)).data.shopper_uid == uid
+          && get(codePath(request.resource.data.last_code_id)).data.owner_uid == request.auth.uid
+          && getAfter(codePath(request.resource.data.last_code_id)).data.status == 'confirmed'
+        );
+    }
+
+    // ---------- shops ----------
+
+    function validOffer(o) {
+      return o == null || (
+        o is map
+        && o.id is string && o.id.size() > 0 && o.id.size() <= 64
+        && o.discount_type in ['percentage', 'flat', 'bogo']
+        && o.discount_value is number && o.discount_value > 0 && o.discount_value <= 100000
+        && (o.discount_type != 'percentage' || o.discount_value <= 100)
+        && o.description is string && o.description.size() <= 300
+        && o.is_active is bool
+      );
+    }
+
+    function validShop(d) {
+      return d.keys().hasOnly([
+          'owner_uid', 'name', 'category', 'image_url', 'address', 'latitude', 'longitude',
+          'opening_hours', 'is_active', 'daily_cap', 'offer', 'verified',
+          'active_from', 'active_until', 'created_at', 'updated_at', 'last_active_at'
+        ])
+        && d.keys().hasAll([
+          'owner_uid', 'name', 'category', 'latitude', 'longitude',
+          'opening_hours', 'is_active', 'daily_cap', 'verified', 'created_at', 'updated_at'
+        ])
+        && d.name is string && d.name.size() > 0 && d.name.size() <= 80
+        && d.category in ['grocery', 'bakery', 'pharmacy', 'cafe', 'books', 'electronics',
+                          'restaurant', 'clothing', 'stationery', 'other']
+        && (d.get('image_url', null) == null
+            || (d.image_url is string && d.image_url.size() < 60000))
+        && (d.get('address', null) == null
+            || (d.address is string && d.address.size() <= 200))
+        && d.latitude is number && d.latitude >= -90 && d.latitude <= 90
+        && d.longitude is number && d.longitude >= -180 && d.longitude <= 180
+        && d.opening_hours is map
+        && d.is_active is bool
+        && d.daily_cap is int && d.daily_cap >= 1 && d.daily_cap <= 1000
+        && validOffer(d.get('offer', null))
+        && d.updated_at == request.time;
+    }
+
+    match /shops/{shopId} {
+      allow read: if true;
+
+      allow create: if signedIn()
+        && validShop(request.resource.data)
+        && request.resource.data.owner_uid == request.auth.uid
+        && request.resource.data.verified == false
+        && request.resource.data.created_at == request.time;
+
+      allow update: if signedIn()
+        && resource.data.owner_uid == request.auth.uid
+        && validShop(request.resource.data)
+        && request.resource.data.owner_uid == resource.data.owner_uid
+        && request.resource.data.verified == resource.data.verified
+        && request.resource.data.created_at == resource.data.created_at;
+
+      // No client deletes: owners pause a listing instead (keeps redemption history).
+      allow delete: if false;
+
+      // Per-day code counter used to enforce the shop's daily cap atomically.
+      // A counter can only move up by exactly 1, and only together with a NEW
+      // code document created in the same transaction (see validNewCode).
+      match /daily/{dayId} {
+        allow read: if signedIn();
+
+        allow create: if signedIn()
+          && dayId == dayKey()
+          && validDay(shopId, request.resource.data)
+          && request.resource.data.count == 1;
+
+        allow update: if signedIn()
+          && dayId == dayKey()
+          && validDay(shopId, request.resource.data)
+          && request.resource.data.count == resource.data.count + 1;
+
+        allow delete: if false;
+      }
+    }
+
+    function validDay(shopId, d) {
+      return d.keys().hasOnly(['count', 'last_code_id'])
+        && d.count is int
+        && d.count <= get(shopPath(shopId)).data.daily_cap
+        && d.last_code_id is string
+        && !exists(codePath(d.last_code_id))
+        && existsAfter(codePath(d.last_code_id))
+        && getAfter(codePath(d.last_code_id)).data.shop_id == shopId;
+    }
+
+    // Full-size shop photo (the small thumbnail lives on the shop document).
+    match /shop_images/{shopId} {
+      allow read: if true;
+      allow create, update: if signedIn()
+        && get(shopPath(shopId)).data.owner_uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['data_url', 'updated_at'])
+        && request.resource.data.data_url is string
+        && request.resource.data.data_url.size() < 900000
+        && request.resource.data.updated_at == request.time;
+      allow delete: if signedIn() && get(shopPath(shopId)).data.owner_uid == request.auth.uid;
+    }
+
+    // ---------- codes ----------
+    // Document id is "<shopId>_<6 digit code>", so a code number is unique per
+    // shop and a shopkeeper can look a code up by id.
+
+    function validNewCode(codeId, d) {
+      let shop = get(shopPath(d.shop_id)).data;
+      let day = dayPath(d.shop_id);
+      return d.keys().hasOnly([
+          'shop_id', 'shop_name', 'owner_uid', 'shopper_uid', 'shopper_name', 'offer_id', 'code',
+          'status', 'locked_discount_type', 'locked_discount_value', 'locked_offer_description',
+          'distance_m', 'generated_at'
+        ])
+        && d.keys().hasAll([
+          'shop_id', 'shop_name', 'owner_uid', 'shopper_uid', 'shopper_name', 'offer_id', 'code',
+          'status', 'locked_discount_type', 'locked_discount_value', 'locked_offer_description',
+          'distance_m', 'generated_at'
+        ])
+        && d.code is string && d.code.matches('^[0-9]{6}$')
+        && codeId == d.shop_id + '_' + d.code
+        && d.shopper_uid == request.auth.uid
+        && d.owner_uid == shop.owner_uid
+        && d.owner_uid != request.auth.uid
+        && d.shop_name == shop.name
+        && d.shopper_name is string && d.shopper_name.size() <= 60
+        && shop.is_active == true
+        && shop.offer != null
+        && shop.offer.is_active == true
+        && d.offer_id == shop.offer.id
+        && d.locked_discount_type == shop.offer.discount_type
+        && d.locked_discount_value == shop.offer.discount_value
+        && d.locked_offer_description == shop.offer.description
+        && d.status == 'active'
+        && d.distance_m is int && d.distance_m >= 0 && d.distance_m <= 600
+        && d.generated_at == request.time
+        && getAfter(day).data.last_code_id == codeId
+        && getAfter(day).data.count == (exists(day) ? get(day).data.count + 1 : 1);
+    }
+
+    function validConfirm(old, n) {
+      return signedIn()
+        && old.owner_uid == request.auth.uid
+        && old.status == 'active'
+        && n.status == 'confirmed'
+        && request.time < old.generated_at + duration.value(20, 'm')
+        && n.diff(old).affectedKeys().hasOnly([
+          'status', 'confirmed_at', 'confirmed_by_uid', 'bill_amount', 'saved_amount'
+        ])
+        && n.confirmed_at == request.time
+        && n.confirmed_by_uid == request.auth.uid
+        && numOrNull(n.get('bill_amount', null))
+        && numOrNull(n.get('saved_amount', null));
+    }
+
+    match /codes/{codeId} {
+      // `resource == null` lets the code generator probe an unused id inside a transaction.
+      allow get: if signedIn()
+        && (resource == null
+            || resource.data.shopper_uid == request.auth.uid
+            || resource.data.owner_uid == request.auth.uid);
+
+      allow list: if signedIn()
+        && (resource.data.shopper_uid == request.auth.uid
+            || resource.data.owner_uid == request.auth.uid);
+
+      allow create: if signedIn() && validNewCode(codeId, request.resource.data);
+
+      allow update: if validConfirm(resource.data, request.resource.data);
+
+      allow delete: if false; // audit trail
+    }
+
+    // ---------- reviews: only for a CONFIRMED redemption, one per code ----------
+
+    match /reviews/{reviewId} {
+      allow read: if true;
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly([
+          'shop_id', 'code_id', 'reviewer_uid', 'reviewer_name', 'rating', 'comment', 'created_at'
+        ])
+        && reviewId == request.resource.data.code_id
+        && request.resource.data.reviewer_uid == request.auth.uid
+        && request.resource.data.reviewer_name is string
+        && request.resource.data.reviewer_name.size() <= 60
+        && request.resource.data.rating is int
+        && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
+        && request.resource.data.comment is string
+        && request.resource.data.comment.size() <= 300
+        && request.resource.data.created_at == request.time
+        && get(codePath(request.resource.data.code_id)).data.status == 'confirmed'
+        && get(codePath(request.resource.data.code_id)).data.shopper_uid == request.auth.uid
+        && get(codePath(request.resource.data.code_id)).data.shop_id == request.resource.data.shop_id;
+
+      allow update, delete: if false;
+    }
+
+    // ---------- dispute reports: write-only from the app (review in the console) ----------
+
+    match /reports/{reportId} {
+      allow read: if false;
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly([
+          'code_id', 'shop_id', 'reporter_uid', 'reporter_role', 'report_type', 'description', 'created_at'
+        ])
+        && request.resource.data.reporter_uid == request.auth.uid
+        && request.resource.data.reporter_role in ['shopper', 'shopkeeper']
+        && request.resource.data.report_type in ['dispute', 'expired', 'not_honored', 'misuse', 'other']
+        && request.resource.data.description is string
+        && request.resource.data.description.size() > 0
+        && request.resource.data.description.size() <= 1000
+        && request.resource.data.created_at == request.time
+        && get(codePath(request.resource.data.code_id)).data.shop_id == request.resource.data.shop_id
+        && (get(codePath(request.resource.data.code_id)).data.shopper_uid == request.auth.uid
+            || get(codePath(request.resource.data.code_id)).data.owner_uid == request.auth.uid);
+
+      allow update, delete: if false;
+    }
+  }
+}
